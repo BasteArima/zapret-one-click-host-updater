@@ -114,9 +114,11 @@ function Save-Backup([string]$path) {
 function Get-SourceUrl {
     if ($Url) { return $Url }
     # если скрипт лежит рядом с service.bat — берём адрес прямо оттуда,
-    # чтобы переезд репозитория не ломал обновление
-    if ($PSScriptRoot) {
-        $svc = Join-Path $PSScriptRoot 'service.bat'
+    # чтобы переезд репозитория не ломал обновление.
+    # ZHU_SCRIPTDIR выставляет однофайловая .bat-сборка (сам код выполняется из %TEMP%).
+    $root = if ($env:ZHU_SCRIPTDIR) { $env:ZHU_SCRIPTDIR } else { $PSScriptRoot }
+    if ($root) {
+        $svc = Join-Path $root 'service.bat'
         if (Test-Path -LiteralPath $svc) {
             $m = [regex]::Match((Get-Content -LiteralPath $svc -Raw), 'set\s+"hostsUrl=([^"]+)"')
             if ($m.Success) {
