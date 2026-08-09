@@ -9,10 +9,15 @@
     При повторном запуске старый блок удаляется целиком и заменяется свежим,
     поэтому мусор в hosts не накапливается.
 
-    Запуск: правой кнопкой по update-hosts.bat -> Запуск от имени администратора
-            (или просто двойным кликом — скрипт сам попросит права).
+    Запуск без параметров открывает меню (обновить сейчас / настроить автообновление).
+    Права администратора запрашиваются один раз при запуске; задача автообновления
+    выполняется от имени SYSTEM, поэтому UAC при автозапусках не появляется.
 
     Параметры:
+        -Update          сразу обновить hosts, без меню
+        -Schedule <Ч:ММ> включить ежедневное автообновление в указанное время и выйти
+        -Unschedule      отключить автообновление
+        -Status          показать состояние автообновления
         -Url <адрес>     свой источник списка (по умолчанию берётся из service.bat
                          рядом со скриптом, иначе — репозиторий Flowseal)
         -Remove          удалить блок zapret из hosts и выйти
@@ -26,6 +31,11 @@
 param(
     [string] $Url,
     [string] $HostsPath,
+    [string] $Schedule,
+    [string] $ZapretDir,
+    [switch] $Update,
+    [switch] $Unschedule,
+    [switch] $Status,
     [switch] $Remove,
     [switch] $KeepConflicts,
     [switch] $NoFlushDns,
@@ -39,14 +49,34 @@ $DefaultUrl = 'https://raw.githubusercontent.com/Flowseal/zapret-discord-youtube
 $BeginMark  = '# >>> ZAPRET HOSTS BEGIN >>>'
 $EndMark    = '# <<< ZAPRET HOSTS END <<<'
 $MinEntries = 20   # меньше этого числа записей считаем битой загрузкой
+$TaskName   = 'Zapret Hosts Update'
+$DataDir    = Join-Path $env:ProgramData 'ZapretHostsUpdater'
+$LogPath    = Join-Path $DataDir 'update.log'
+$LogMaxSize = 512KB
 
 try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch { }
 
 # ----------------------------------------------------------------- утилиты ---
-function Write-Step  ([string]$m) { Write-Host "[*] $m" -ForegroundColor Cyan }
-function Write-Ok    ([string]$m) { Write-Host "[+] $m" -ForegroundColor Green }
-function Write-Warn2 ([string]$m) { Write-Host "[!] $m" -ForegroundColor Yellow }
-function Write-Err   ([string]$m) { Write-Host "[X] $m" -ForegroundColor Red }
+# Пишет строку в общий лог — он нужен, когда обновление идёт по расписанию и
+# консоли никто не видит.
+function Write-Log ([string]$m) {
+    try {
+        if (-not (Test-Path -LiteralPath $DataDir)) {
+            New-Item -ItemType Directory -Path $DataDir -Force | Out-Null
+        }
+        if ((Test-Path -LiteralPath $LogPath) -and (Get-Item -LiteralPath $LogPath).Length -gt $LogMaxSize) {
+            $tail = Get-Content -LiteralPath $LogPath -Tail 200
+            Set-Content -LiteralPath $LogPath -Value $tail -Encoding UTF8
+        }
+        Add-Content -LiteralPath $LogPath -Encoding UTF8 `
+            -Value ('{0}  {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $m)
+    } catch { }
+}
+
+function Write-Step  ([string]$m) { Write-Host "[*] $m" -ForegroundColor Cyan;   Write-Log "[*] $m" }
+function Write-Ok    ([string]$m) { Write-Host "[+] $m" -ForegroundColor Green;  Write-Log "[+] $m" }
+function Write-Warn2 ([string]$m) { Write-Host "[!] $m" -ForegroundColor Yellow; Write-Log "[!] $m" }
+function Write-Err   ([string]$m) { Write-Host "[X] $m" -ForegroundColor Red;    Write-Log "[X] $m" }
 
 function Test-Admin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -55,7 +85,9 @@ function Test-Admin {
 }
 
 function Pause-IfNeeded {
-    if (-not $NoPause) {
+    # [Environment]::UserInteractive защищает от зависания, если запуск идёт
+    # из планировщика без -NoPause
+    if (-not $NoPause -and [Environment]::UserInteractive) {
         Write-Host ''
         try { Read-Host 'Нажмите Enter для выхода' | Out-Null } catch { }
     }
@@ -115,8 +147,12 @@ function Get-SourceUrl {
     if ($Url) { return $Url }
     # если скрипт лежит рядом с service.bat — берём адрес прямо оттуда,
     # чтобы переезд репозитория не ломал обновление.
-    # ZHU_SCRIPTDIR выставляет однофайловая .bat-сборка (сам код выполняется из %TEMP%).
-    $root = if ($env:ZHU_SCRIPTDIR) { $env:ZHU_SCRIPTDIR } else { $PSScriptRoot }
+    # ZapretDir прописывается в задачу планировщика (установленная копия лежит
+    # в ProgramData и сама рядом с service.bat уже не находится).
+    # ZHU_SCRIPTDIR выставляет однофайловая .bat-сборка (код выполняется из %TEMP%).
+    $root = if ($ZapretDir) { $ZapretDir }
+            elseif ($env:ZHU_SCRIPTDIR) { $env:ZHU_SCRIPTDIR }
+            else { $PSScriptRoot }
     if ($root) {
         $svc = Join-Path $root 'service.bat'
         if (Test-Path -LiteralPath $svc) {
@@ -154,8 +190,172 @@ function Get-RemoteHosts([string]$sourceUrl) {
     return [string]$content
 }
 
+# ------------------------------------------------------------ планировщик ----
+# Задача планировщика не должна зависеть от того, где лежит исходный файл:
+# его могут удалить, переименовать или перенести. Поэтому при настройке
+# расписания копия кладётся в ProgramData, и задача указывает уже на неё.
+function Install-SelfCopy {
+    if (-not (Test-Path -LiteralPath $DataDir)) {
+        New-Item -ItemType Directory -Path $DataDir -Force | Out-Null
+    }
+
+    $selfBat = if ($env:ZHU_SELF -and (Test-Path -LiteralPath $env:ZHU_SELF)) { $env:ZHU_SELF } else { $null }
+    if ($selfBat) {
+        $origin = Split-Path -Parent $selfBat
+        $target = Join-Path $DataDir 'update-hosts.bat'
+        if ((Resolve-Path -LiteralPath $selfBat).Path -ine $target) {
+            Copy-Item -LiteralPath $selfBat -Destination $target -Force
+        }
+        return [pscustomobject]@{
+            Exe     = $target
+            Args    = '-Update -NoPause'
+            WorkDir = $DataDir
+            Origin  = $origin
+            Copied  = $target
+        }
+    }
+
+    # запуск напрямую из .ps1 — ставим копию скрипта и зовём её через powershell.exe
+    $origin = Split-Path -Parent $PSCommandPath
+    $target = Join-Path $DataDir 'update-hosts.ps1'
+    if ((Resolve-Path -LiteralPath $PSCommandPath).Path -ine $target) {
+        Copy-Item -LiteralPath $PSCommandPath -Destination $target -Force
+    }
+    return [pscustomobject]@{
+        Exe     = (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe')
+        Args    = ('-NoProfile -ExecutionPolicy Bypass -File "{0}" -Update -NoPause' -f $target)
+        WorkDir = $DataDir
+        Origin  = $origin
+        Copied  = $target
+    }
+}
+
+function Remove-SelfCopy {
+    foreach ($n in 'update-hosts.bat', 'update-hosts.ps1') {
+        $f = Join-Path $DataDir $n
+        # запущенный .bat удалить не даст сам cmd — это не ошибка, просто пропускаем
+        if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+# Принимает 3:30, 03:30, 9:5, 23.59, 0730, 9 — возвращает [datetime] сегодняшнего дня.
+function ConvertTo-ScheduleTime ([string]$s) {
+    $t = ($s -replace '\s', '')
+    if ($t -match '^(\d{1,2})[:.\-,](\d{1,2})$') {
+        $h = [int]$Matches[1]; $m = [int]$Matches[2]
+    } elseif ($t -match '^(\d{1,2})$') {
+        $h = [int]$Matches[1]; $m = 0
+    } elseif ($t -match '^(\d{1,2})(\d{2})$') {
+        $h = [int]$Matches[1]; $m = [int]$Matches[2]
+    } else {
+        throw "Не понял время «$s». Формат: Ч:ММ, например 3:30, 03:30, 9:5 или 23:59."
+    }
+    if ($h -lt 0 -or $h -gt 23) { throw "Часы должны быть от 0 до 23, а не $h." }
+    if ($m -lt 0 -or $m -gt 59) { throw "Минуты должны быть от 0 до 59, а не $m." }
+    (Get-Date -Hour $h -Minute $m -Second 0 -Millisecond 0)
+}
+
+function Test-SchedulerModule {
+    $null -ne (Get-Command Register-ScheduledTask -ErrorAction SilentlyContinue)
+}
+
+function Get-ZhuTask {
+    if (-not (Test-SchedulerModule)) { return $null }
+    Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+}
+
+function Show-ScheduleStatus {
+    if (Test-SchedulerModule) {
+        $task = Get-ZhuTask
+        if (-not $task) {
+            Write-Host '  Автообновление: ' -NoNewline
+            Write-Host 'выключено' -ForegroundColor DarkGray
+            return
+        }
+        $at = @($task.Triggers | ForEach-Object { $_.StartBoundary } | Where-Object { $_ }) |
+              ForEach-Object { ([datetime]$_).ToString('HH:mm') }
+        $info = Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction SilentlyContinue
+        Write-Host '  Автообновление: ' -NoNewline
+        Write-Host ('включено, ежедневно в {0}' -f ($at -join ', ')) -ForegroundColor Green
+        if ($info) {
+            if ($info.LastRunTime -and $info.LastRunTime.Year -gt 1999) {
+                $res = if ($info.LastTaskResult -eq 0) { 'успешно' } else { "код $($info.LastTaskResult)" }
+                Write-Host ('  Последний запуск: {0} ({1})' -f $info.LastRunTime, $res) -ForegroundColor DarkGray
+            }
+            if ($info.NextRunTime) {
+                Write-Host ('  Следующий запуск: {0}' -f $info.NextRunTime) -ForegroundColor DarkGray
+            }
+        }
+        # задача могла остаться от старой версии или её файл могли удалить вручную
+        $exe = @($task.Actions | ForEach-Object { $_.Execute })[0]
+        if ($exe -and -not (Test-Path -LiteralPath ($exe -replace '^"|"$', ''))) {
+            Write-Warn2 ('Задача ссылается на несуществующий файл: {0}' -f $exe)
+            Write-Warn2 'Настройте автообновление заново (пункт 2) — иначе оно не сработает.'
+        }
+    } else {
+        $out = schtasks /query /tn "$TaskName" 2>&1
+        if ($LASTEXITCODE -eq 0) { Write-Host '  Автообновление: включено' -ForegroundColor Green }
+        else { Write-Host '  Автообновление: выключено' -ForegroundColor DarkGray }
+    }
+}
+
+function Set-ZhuSchedule ([datetime]$at) {
+    $cmd = Install-SelfCopy
+
+    # адрес списка берётся из service.bat, но установленная копия лежит не рядом с ним —
+    # запоминаем исходную папку прямо в аргументах задачи
+    $taskArgs = $cmd.Args
+    if ($cmd.Origin -and (Test-Path -LiteralPath (Join-Path $cmd.Origin 'service.bat'))) {
+        $taskArgs += (' -ZapretDir "{0}"' -f $cmd.Origin.TrimEnd('\'))
+    }
+
+    if (Test-SchedulerModule) {
+        $action  = New-ScheduledTaskAction -Execute $cmd.Exe -Argument $taskArgs -WorkingDirectory $cmd.WorkDir
+        $trigger = New-ScheduledTaskTrigger -Daily -At $at
+        # SYSTEM: задача идёт с полными правами и без UAC, даже если никто не залогинен
+        $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+        $settings  = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries `
+                        -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Minutes 10) `
+                        -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 5) `
+                        -MultipleInstances IgnoreNew
+        Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
+            -Principal $principal -Settings $settings -Force `
+            -Description 'Обновление hosts записями zapret (update-hosts).' | Out-Null
+    } else {
+        $tr = '"{0}" {1}' -f $cmd.Exe, $taskArgs
+        schtasks /create /tn "$TaskName" /tr $tr /sc daily /st $at.ToString('HH:mm') `
+                 /ru SYSTEM /rl HIGHEST /f | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw 'Не удалось создать задачу через schtasks.' }
+    }
+
+    Write-Ok ('Автообновление включено: ежедневно в {0}' -f $at.ToString('HH:mm'))
+    Write-Host '    Запускается от имени SYSTEM — запросов UAC больше не будет.' -ForegroundColor DarkGray
+    Write-Host  '    Пропущенные запуски (ПК был выключен) выполняются при включении.' -ForegroundColor DarkGray
+    Write-Host ('    Рабочая копия: {0}' -f $cmd.Copied) -ForegroundColor DarkGray
+    Write-Host  '    Исходный файл теперь можно переносить или удалять.' -ForegroundColor DarkGray
+    Write-Host ('    Лог: {0}' -f $LogPath) -ForegroundColor DarkGray
+}
+
+function Remove-ZhuSchedule {
+    if (Test-SchedulerModule) {
+        if (-not (Get-ZhuTask)) { Write-Ok 'Автообновление и так выключено.'; Remove-SelfCopy; return }
+        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+    } else {
+        schtasks /delete /tn "$TaskName" /f | Out-Null
+        if ($LASTEXITCODE -ne 0) { Write-Ok 'Автообновление и так выключено.'; return }
+    }
+    Remove-SelfCopy
+    Write-Ok 'Автообновление выключено.'
+}
+
 # --------------------------------------------------------------- элевация ----
-if (-not $HostsPath -and -not (Test-Admin)) {
+# проверяем время до запроса UAC, чтобы опечатка не стоила лишнего окна
+if ($Schedule) {
+    try { $null = ConvertTo-ScheduleTime $Schedule }
+    catch { Write-Err $_.Exception.Message; Pause-IfNeeded; exit 1 }
+}
+
+if (-not $HostsPath -and -not $Status -and -not (Test-Admin)) {
     Write-Warn2 'Нужны права администратора — перезапускаю с запросом UAC...'
     $argsList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath)
     foreach ($kv in $PSBoundParameters.GetEnumerator()) {
@@ -175,14 +375,15 @@ if (-not $HostsPath -and -not (Test-Admin)) {
 }
 
 # ------------------------------------------------------------------ работа ---
-$exitCode = 0
-try {
-    if (-not $HostsPath) {
-        $HostsPath = Join-Path $env:SystemRoot 'System32\drivers\etc\hosts'
-    }
+$HostsPathWasGiven = $PSBoundParameters.ContainsKey('HostsPath')
+if (-not $HostsPath) {
+    $HostsPath = Join-Path $env:SystemRoot 'System32\drivers\etc\hosts'
+}
 
+# Возвращает код возврата: 0 — успех, 1 — ошибка.
+function Invoke-HostsUpdate {
+  try {
     Write-Host ''
-    Write-Host '  ZAPRET HOSTS UPDATER' -ForegroundColor White
     Write-Host "  hosts: $HostsPath" -ForegroundColor DarkGray
     Write-Host ''
 
@@ -234,16 +435,14 @@ try {
     if ($Remove) {
         if (-not $hadBlock) {
             Write-Ok 'Блока zapret в hosts нет — удалять нечего.'
-            Pause-IfNeeded
-            exit 0
+            return 0
         }
         $newText = (($kept -join "`r`n").TrimEnd() + "`r`n")
         $backup = Save-Backup $HostsPath
         Write-TextFileSmart $HostsPath $newText $file.Encoding
         Write-Ok "Блок zapret удалён. Резервная копия: $backup"
         if (-not $NoFlushDns) { ipconfig /flushdns | Out-Null; Write-Ok 'DNS-кэш сброшен.' }
-        Pause-IfNeeded
-        exit 0
+        return 0
     }
 
     # --- 4. скачиваем свежий список ---
@@ -293,8 +492,7 @@ try {
 
     if ($sameBlock -and $removedConflicts.Count -eq 0) {
         Write-Ok 'hosts уже актуален — изменения не требуются.'
-        Pause-IfNeeded
-        exit 0
+        return 0
     }
 
     # --- 7. собираем новый файл ---
@@ -341,6 +539,94 @@ try {
     if (-not $NoFlushDns) {
         ipconfig /flushdns | Out-Null
         Write-Ok 'DNS-кэш сброшен.'
+    }
+    return 0
+  }
+  catch {
+    Write-Host ''
+    Write-Err $_.Exception.Message
+    return 1
+  }
+}
+
+# -------------------------------------------------------------------- меню ---
+function Show-Menu {
+    while ($true) {
+        Write-Host ''
+        Write-Host '  ZAPRET HOSTS UPDATER' -ForegroundColor White
+        Show-ScheduleStatus
+        Write-Host ''
+        Write-Host '  1. Обновить hosts сейчас'
+        Write-Host '  2. Настроить автообновление (ежедневно в заданное время)'
+        Write-Host '  3. Отключить автообновление'
+        Write-Host '  4. Удалить записи zapret из hosts'
+        Write-Host '  5. Открыть папку с hosts'
+        Write-Host '  0. Выход'
+        Write-Host ''
+        $choice = Read-Host '  Выбор'
+
+        switch ($choice.Trim()) {
+            '1' { $null = @(Invoke-HostsUpdate) }
+            '2' {
+                Write-Host ''
+                Write-Host '  Во сколько обновлять? Формат Ч:ММ, 24-часовой.' -ForegroundColor DarkGray
+                Write-Host '  Примеры: 3:30, 03:30, 9:5, 23:59' -ForegroundColor DarkGray
+                $answer = Read-Host '  Время'
+                if ($answer.Trim() -eq '') { break }
+                try {
+                    $at = ConvertTo-ScheduleTime $answer
+                    Set-ZhuSchedule $at
+                } catch {
+                    Write-Err $_.Exception.Message
+                }
+            }
+            '3' { try { Remove-ZhuSchedule } catch { Write-Err $_.Exception.Message } }
+            '4' {
+                $script:Remove = [switch]$true
+                $null = @(Invoke-HostsUpdate)
+                $script:Remove = [switch]$false
+            }
+            '5' {
+                if (Test-Path -LiteralPath $HostsPath) {
+                    Start-Process explorer.exe -ArgumentList ('/select,"{0}"' -f $HostsPath)
+                } else {
+                    Start-Process explorer.exe -ArgumentList ('"{0}"' -f (Split-Path -Parent $HostsPath))
+                }
+                Write-Ok 'Папка открыта.'
+            }
+            '0' { return 0 }
+            ''  { return 0 }
+            default { Write-Warn2 'Нет такого пункта.' }
+        }
+        Write-Host ''
+        Write-Host '  --------------------------------------------------' -ForegroundColor DarkGray
+    }
+}
+
+# --------------------------------------------------------------- диспетчер ---
+$exitCode = 0
+try {
+    if ($Status) {
+        Write-Host ''
+        Show-ScheduleStatus
+    }
+    elseif ($Unschedule) {
+        Remove-ZhuSchedule
+    }
+    elseif ($Schedule) {
+        Set-ZhuSchedule (ConvertTo-ScheduleTime $Schedule)
+    }
+    elseif ($Update -or $Remove -or $HostsPathWasGiven -or $Url -or $NoPause -or
+            -not [Environment]::UserInteractive) {
+        # любой явный параметр => работаем без меню (в том числе запуск из планировщика)
+        Write-Host ''
+        Write-Host '  ZAPRET HOSTS UPDATER' -ForegroundColor White
+        $exitCode = @(Invoke-HostsUpdate)[-1]
+    }
+    else {
+        $exitCode = @(Show-Menu)[-1]
+        # выход из меню — это уже осознанное «закрыть», второй Enter не нужен
+        $NoPause = [switch]$true
     }
 }
 catch {
