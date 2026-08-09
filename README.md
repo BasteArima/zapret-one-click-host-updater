@@ -4,7 +4,10 @@
 [zapret-discord-youtube](https://github.com/Flowseal/zapret-discord-youtube) **в один запуск**,
 вместо ручного копирования через пункт «9. Update Hosts File» в `service.bat`.
 
-## Что раздавать
+Есть две версии: **`update-hosts.bat`** для Windows и **`update-hosts.sh`** для Linux.
+Ниже сначала Windows, потом [Linux](#linux).
+
+## Что раздавать (Windows)
 
 Один-единственный файл — **`update-hosts.bat`**. Он самодостаточный: PowerShell-код лежит
 внутри него же, после строки `exit /b` (cmd туда не дочитывает). При запуске код
@@ -18,9 +21,10 @@ zapret: тогда адрес списка берётся прямо из `servi
 
 | Файл | Назначение |
 |---|---|
-| `update-hosts.ps1` | Исходник, вся логика. **Править нужно его** |
+| `update-hosts.ps1` | Исходник для Windows, вся логика. **Править нужно его** |
 | `build.ps1` | Собирает `update-hosts.bat` из исходника |
 | `update-hosts.bat` | Собранный однофайловый результат — то, что раздаётся |
+| `update-hosts.sh` | Версия для Linux, самостоятельный файл, сборка не нужна |
 
 Пересборка после правок:
 
@@ -144,6 +148,58 @@ update-hosts.bat -Unschedule
 | `-NoFlushDns` | Не сбрасывать DNS-кэш |
 | `-NoPause` | Не ждать Enter в конце (для планировщика задач) |
 | `-HostsPath <файл>` | Работать с указанным файлом вместо системного `hosts` (для проверки) |
+
+## Linux
+
+Файл **`update-hosts.sh`** — самостоятельный, собирать ничего не нужно. Логика та же:
+тот же блок с теми же маркерами, та же чистка дубликатов, те же проверки скачанного.
+
+```bash
+chmod +x update-hosts.sh
+./update-hosts.sh
+```
+
+Откроется то же меню из пяти пунктов. Root запрашивается через `sudo` один раз при запуске.
+
+### Отличия от Windows-версии
+
+| | Windows | Linux |
+|---|---|---|
+| Права | UAC | `sudo` (скрипт сам перезапустится) |
+| Расписание | Планировщик задач, от `SYSTEM` | systemd-таймер, от `root`; при отсутствии systemd — `cron` |
+| Пропущенные запуски | Догоняются | Догоняются (`Persistent=true`); через cron — **нет** |
+| Рабочая копия | `C:\ProgramData\ZapretHostsUpdater\` | `/usr/local/sbin/update-hosts.sh` |
+| Бэкапы | `%LOCALAPPDATA%\...\backups` | `/var/backups/zapret-hosts-updater/` |
+| Лог | `C:\ProgramData\...\update.log` | `/var/log/zapret-hosts-updater.log` |
+| Сброс DNS | `ipconfig /flushdns` | `resolvectl flush-caches` или `nscd -i hosts`, если есть |
+
+Ключи — те же, но в unix-стиле:
+
+```bash
+./update-hosts.sh --update
+```
+
+```bash
+./update-hosts.sh --schedule 4:15
+```
+
+```bash
+./update-hosts.sh --status
+```
+
+```bash
+./update-hosts.sh --unschedule
+```
+
+Ещё есть `--remove`, `--url <адрес>`, `--keep-conflicts`, `--no-flush-dns`, `--no-pause`,
+`--hosts-path <файл>`, `--help`.
+
+Запись в `/etc/hosts` идёт через `cat`, а не `mv` — так сохраняются inode, права и владелец.
+Это важно в контейнерах и там, где `/etc/hosts` подмонтирован. Если запись не проходит,
+проверьте атрибут immutable: `lsattr /etc/hosts`.
+
+Зависимости: `bash`, `awk`, `sed`, `grep` и `curl` либо `wget` — всё это есть в любом
+дистрибутиве из коробки.
 
 ## Если антивирус ругается
 
